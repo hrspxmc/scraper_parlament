@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 20 00:43:35 2023
+
+@author: hrspx
+"""
+
+import requests
+from unidecode import unidecode
+from bs4 import BeautifulSoup
+from itertools import pairwise
+from tqdm import tqdm
+import time
+import re
+import scraping_functions as scf
+from collections import namedtuple, Counter, defaultdict
+import shelve
+from joblib import Parallel, delayed
+import logging
+import datetime	
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options
+import pandas as pd
+
+#%%
+
+project_root = "/home/hrspx/Documents/GitHub/scraper_parlament/"
+
+def extract_numbers_from_string(txt):
+    return [int(s) for s in txt.split() if s.isdigit()]
+    
+#%%
+
+root_page = 'https://orka.sejm.gov.pl/proc4.nsf'
+
+process_list_page = '/Przebieg%20procesu%20legislacyjnego%20-%20projekty%20ustaw?OpenView&Start={}'
+step_size = 30
+limit = 1600
+process_dict = {}
+
+def scrape_process_list_page(id):
+    page = requests.get(root_page + process_list_page.format(id))
+    soup = BeautifulSoup(page.content, 'html.parser')
+
+    for ii, row in enumerate(soup.find('table').findAll('tr')):
+        
+        if a:=row.findAll('td'):
+            if len(a) > 1:
+                project_number = extract_numbers_from_string(a[0].find(string=True,recursive=False).get_text())[0]
+                process_dict[project_number] = a[1].find('a')['href']
+
+#%%
+for ii in tqdm(range(1,limit,step_size), position=0, leave=True):
+    time.sleep(1)
+    scrape_process_list_page(ii)
+    
+#%% 
+
+def get_section_id(process_list, section_title):
+    if id := [ix for ix,ii in enumerate(process_list) if ii.get_text().strip() in [section_title]]:
+        return id[0]
+    else:
+        return None
+
+def extract_date_from_string(text):
+    match = re.search(r'\d{2}-\d{2}-\d{4}', text)
+    return match.group()
+
+def extract_string_from_tag(soup, string, tag):
+    return [ii.get_text() for ii in soup.find_all(tag) if string in ii.get_text()]
+
+def extract_numbers(string):
+    return [int(word) for word in string if word.isdigit()]
+
+def scrape_project(project_id):
+    page = requests.get('https://orka.sejm.gov.pl' + process_dict[project_id])
+    soup = BeautifulSoup(page.content.decode('utf-8','ignore'), 'html.parser')
+    process_list = [ii for ii in soup.find('table').find_all('td') if ii.get_text() != '']
+
+
+    process_stages_dict = defaultdict(None)
+    
+    tytul = extract_string_from_tag(soup, 'projekt', 'b')[0].strip()
+    
+    nr_druku = extract_string_from_tag(soup, 'druk nr', 'b')[0]
+    nr_druku = [int(word) for word in nr_druku.split() if word.isdigit()][0]
+    
+    data_pisma = extract_date_from_string(extract_string_from_tag(soup, 'wpłynął', 'b')[0])
+    
+    process_stages_dict['nr_druku'] = nr_druku
+    process_stages_dict['tytul'] = tytul
+    process_stages_dict['data_pisma'] = data_pisma
+    
+    if opis_id:=[ix for ix,ii in enumerate(soup.find_all('tr')) if 'OPIS PROJEKTU' in ii.get_text()]:
+        process_stages_dict['opis_projektu'] = soup.find_all('tr')[opis_id[0]+1].get_text().strip()
+        
+    if extract_string_from_tag(soup, 'projekt mający na celu wykonanie prawa Unii Europejskiej', 'td'):
+        process_stages_dict['UE'] = True
+    else:
+        process_stages_dict['UE'] = False
+        
+    if extract_string_from_tag(soup, 'Projekt rozpatrywany w trybie pilnym', 'td'):
+        process_stages_dict['Priorytet'] = True
+    else:
+        process_stages_dict['Priorytet'] = False
+
+    if ii:=get_section_id(process_list, 'I CZYTANIE NA POSIEDZENIU SEJMU'):
+        process_stages_dict['data_skierowania_do_1_czytania'] = extract_date_from_string(process_list[ii+1].get_text())
+        process_stages_dict['miejsce_pierwszego_czytania'] = 'Sejm'
+    elif ii:=get_section_id(process_list, 'I CZYTANIE W KOMISJACH'):
+        process_stages_dict['data_skierowania_do_1_czytania'] = extract_date_from_string(process_list[ii+3].get_text())
+        process_stages_dict['miejsce_pierwszego_czytania'] = 'Komisje'
+
+    if ii:=get_section_id(process_list, 'III CZYTANIE NA POSIEDZENIU SEJMU'):
+        process_stages_dict['data_3_czytania'] = extract_date_from_string(process_list[ii+1].get_text())
+        process_stages_dict['3_czytanie_link'] = process_list[ii+10].find('a')['href']
+        process_stages_dict['decyzja_3_czytanie'] = process_list[ii+13].get_text().strip()
+
+    if ii:=get_section_id(process_list, 'STANOWISKO SENATU'):
+       process_stages_dict['decyzja_senatu'] = process_list[ii+4].get_text().strip()
+
+    if ii:=get_section_id(process_list, 'ROZPATRYWANIE NA FORUM SEJMU STANOWISKA SENATU'):
+       process_stages_dict['decyzja_sejmu_o_senat'] = process_list[ii+4].get_text().strip()
+
+    if ii:=extract_string_from_tag(soup, 'Ustawę przekazano Prezydentowi i Marszałkowi ', 'td'):
+        process_stages_dict['data_przekazania_prezydentowi_marszalkowi'] = extract_date_from_string(ii[0])
+
+    if ii:=extract_string_from_tag(soup, 'przekazano Prezydentowi do', 'td'):
+        process_stages_dict['data_przekazania_prezydentowi'] = extract_date_from_string(ii[0])
+
+    if ii:=extract_string_from_tag(soup, 'Prezydent podpisał ustawę', 'td'):
+        process_stages_dict['data_podpisania_prezydenta'] = extract_date_from_string(ii[0])
+
+    if extract_string_from_tag(soup, 'sprawa niezamknięta', 'td'):
+        process_stages_dict['status'] = 'Niezamknięta'
+    elif extract_string_from_tag(soup, 'odrzucony na pos.', 'td'):
+        process_stages_dict['status'] = 'Odrzucona'
+
+    if ii:=extract_string_from_tag(soup, 'Projekty ustaw zawarte', 'td'):
+        process_stages_dict['procedowany_z'] = ', '.join(re.findall(r'\d+', ii[0]))
+
+    first_word_title = tytul.split(' ')[0]
+    
+    if 'Poselski' in first_word_title:
+        process_stages_dict['wnioskodawca'] = 'Poselski'
+    elif 'Rządowy' in first_word_title  or 'Rzadowy' in first_word_title:
+        process_stages_dict['wnioskodawca'] = 'Rządowy'
+    elif 'Obywatelski' in first_word_title:
+        process_stages_dict['wnioskodawca'] = 'Obywatelski'
+    elif 'Prezydenta' in  first_word_title or 'Przedstawiony' in first_word_title:
+        process_stages_dict['wnioskodawca'] = 'Prezydent'
+    elif 'Senacki' in  first_word_title:
+        process_stages_dict['wnioskodawca'] = 'Senacki'
+    elif 'Komisyjny' in  first_word_title:
+        process_stages_dict['wnioskodawca'] = 'Komisja'
+    else:
+        process_stages_dict['wnioskodawca'] = None
+
+    return process_stages_dict
+#%%
+
+proj_dict = {}
+error_keys = []
+for key in tqdm(list(process_dict.keys()), position=0, leave=True):
+    
+    time.sleep(2)
+    try:
+        proj_dict[key] = scrape_project(key)
+    except:
+        print('Error with key:', key)
+        error_keys.append(key)
+    
+#%%
+
+df = pd.DataFrame.from_dict(proj_dict, orient='index')
+
+df.to_excel("test_sejm_old.xlsx")
+
+#%% debug
+
+page = requests.get('https://orka.sejm.gov.pl' + process_dict[3765])
+soup = BeautifulSoup(page.content.decode('utf-8','ignore'), 'html.parser')
+process_list = [ii for ii in soup.find('table').find_all('td') if ii.get_text() != '']
+
+#%%
+process_stages_dict = defaultdict(None)
+
+tytul = extract_string_from_tag(soup, 'projekt', 'b')[0].strip()
+
+nr_druku = extract_string_from_tag(soup, 'druk nr', 'b')[0]
+nr_druku = [int(word) for word in nr_druku.split() if word.isdigit()][0]
+
+data_pisma = extract_date_from_string(extract_string_from_tag(soup, 'wpłynął', 'b')[0])
+
+process_stages_dict['nr_druku'] = nr_druku
+process_stages_dict['tytul'] = tytul
+process_stages_dict['data_pisma'] = data_pisma
+
+if opis_id:=[ix for ix,ii in enumerate(soup.find_all('tr')) if 'OPIS PROJEKTU' in ii.get_text()]:
+    process_stages_dict['opis_projektu'] = soup.find_all('tr')[opis_id[0]+1].get_text().strip()
+    
+if extract_string_from_tag(soup, 'projekt mający na celu wykonanie prawa Unii Europejskiej', 'td'):
+    process_stages_dict['UE'] = True
+else:
+    process_stages_dict['UE'] = False
+    
+if extract_string_from_tag(soup, 'Projekt rozpatrywany w trybie pilnym', 'td'):
+    process_stages_dict['Priorytet'] = True
+else:
+    process_stages_dict['Priorytet'] = False
+
+if ii:=get_section_id(process_list, 'I CZYTANIE NA POSIEDZENIU SEJMU'):
+    process_stages_dict['data_skierowania_do_1_czytania'] = extract_date_from_string(process_list[ii+1].get_text())
+    process_stages_dict['miejsce_pierwszego_czytania'] = 'Sejm'
+elif ii:=get_section_id(process_list, 'I CZYTANIE W KOMISJACH'):
+    process_stages_dict['data_skierowania_do_1_czytania'] = extract_date_from_string(process_list[ii+3].get_text())
+    process_stages_dict['miejsce_pierwszego_czytania'] = 'Komisje'
+
+if ii:=get_section_id(process_list, 'III CZYTANIE NA POSIEDZENIU SEJMU'):
+    process_stages_dict['data_3_czytania'] = extract_date_from_string(process_list[ii+1].get_text())
+    process_stages_dict['3_czytanie_link'] = process_list[ii+10].find('a')['href']
+    process_stages_dict['decyzja_3_czytanie'] = process_list[ii+13].get_text().strip()
+
+if ii:=get_section_id(process_list, 'STANOWISKO SENATU'):
+   process_stages_dict['decyzja_senatu'] = process_list[ii+4].get_text().strip()
+
+if ii:=get_section_id(process_list, 'ROZPATRYWANIE NA FORUM SEJMU STANOWISKA SENATU'):
+   process_stages_dict['decyzja_sejmu_o_senat'] = process_list[ii+4].get_text().strip()
+
+if ii:=extract_string_from_tag(soup, 'Ustawę przekazano Prezydentowi i Marszałkowi ', 'td'):
+    process_stages_dict['data_przekazania_prezydentowi_marszalkowi'] = extract_date_from_string(ii[0])
+
+if ii:=extract_string_from_tag(soup, 'przekazano Prezydentowi do', 'td'):
+    process_stages_dict['data_przekazania_prezydentowi'] = extract_date_from_string(ii[0])
+
+if ii:=extract_string_from_tag(soup, 'Prezydent podpisał ustawę', 'td'):
+    process_stages_dict['data_podpisania_prezydenta'] = extract_date_from_string(ii[0])
+
+if extract_string_from_tag(soup, 'sprawa niezamknięta', 'td'):
+    process_stages_dict['status'] = 'Niezamknięta'
+elif extract_string_from_tag(soup, 'odrzucony na pos.', 'td'):
+    process_stages_dict['status'] = 'Odrzucona'
+
+if 'Poselski' in tytul:
+    process_stages_dict['wnioskodawca'] = 'Poselski'
+elif 'Rządowy' in tytul  or 'Rzadowy' in tytul:
+    process_stages_dict['wnioskodawca'] = 'Rządowy'
+elif 'Obywatelski' in tytul:
+    process_stages_dict['wnioskodawca'] = 'Obywatelski'
+elif 'Prezydenta' in  tytul:
+    process_stages_dict['wnioskodawca'] = 'Prezydent'
+elif 'Senacki' in  tytul:
+    process_stages_dict['wnioskodawca'] = 'Senacki'
+elif 'Komisyjny' in  tytul:
+    process_stages_dict['wnioskodawca'] = 'Komisja'
+else:
+    process_stages_dict['wnioskodawca'] = None
+
+#%%
+
+
+#%%
+
+
